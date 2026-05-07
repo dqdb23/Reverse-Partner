@@ -1,4 +1,4 @@
-# Reverse Partner— IDA Pro 9.0
+# Reverse Partner— IDA Pro 9.X
 
 AI-powered function renamer for authorized malware reverse engineering.  
 Modular, debug-safe, supports local and cloud AI providers.
