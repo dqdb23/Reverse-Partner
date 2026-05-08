@@ -20,7 +20,10 @@ try:
     import ida_kernwin
     _IN_IDA = True
 except ImportError:
-    pass
+    idaapi = None
+    idc = None
+    ida_kernwin = None
+    _IN_IDA = False
 
 from guards import require_static_mode, is_debugger_active
 from logger import log
@@ -397,8 +400,11 @@ def show_review_queue_ui():
                     _update_queue_status(it, "rejected")
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
+    if ida_kernwin is None:
+        log.warn("Review queue UI requires ida_kernwin.")
+        return
+
     try:
-        import ida_kernwin
         c = _Chooser(pending)
         c.Show()
     except Exception as exc:
