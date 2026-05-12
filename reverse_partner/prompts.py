@@ -240,6 +240,7 @@ def build_prompt(batch: list, cfg: dict = None) -> str:
         consts  = item.get("constants", [])
         pre_tags = item.get("pre_tags", [])
         mitre   = item.get("mitre_hints", [])
+        proposal_context = item.get("proposal_context", "")
         structs = item.get("struct_accesses", [])
         lvars   = item.get("local_vars", [])
 
@@ -272,6 +273,8 @@ def build_prompt(batch: list, cfg: dict = None) -> str:
             header += "\n// Static pre-tags (informational): %s" % ", ".join(pre_tags)
         if mitre:
             header += "\n// MITRE hints: %s" % "; ".join(mitre[:3])
+        if proposal_context:
+            header += "\n// Tentative callee rename context (not ground truth):\n%s" % proposal_context
         if lvars:
             lv_strs = ["%s:%s" % (v["name"], v["type"]) for v in lvars[:8]]
             header += "\n// Local vars: %s" % ", ".join(lv_strs)

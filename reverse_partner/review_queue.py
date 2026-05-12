@@ -99,12 +99,17 @@ def add_to_review_queue(ea: int, old_name: str, ai_result: dict,
         "description":    ai_result.get("description", ""),
         "evidence":       ai_result.get("evidence", []),
         "warnings":       ai_result.get("warnings", []),
+        "depends_on_pending_suggestions": ai_result.get("depends_on_pending_suggestions", []),
+        "confidence_adjustment": ai_result.get("confidence_adjustment", {}),
+        "dependency_level": ai_result.get("dependency_level", 0),
+        "child_support_confidence": ai_result.get("child_support_confidence", None),
         "model":          model,
         "provider":       provider,
         "timestamp":      time.strftime("%Y-%m-%d %H:%M:%S"),
         "status":         "pending",   # pending | applied | rejected
     }
     queue.append(entry)
+    queue = sort_review_queue_dependencies(queue)
     save_review_queue(queue)
 
 
@@ -160,6 +165,79 @@ def add_prototype_to_review_queue(ea: int, func_name: str, old_prototype: str,
     save_review_queue(queue)
 
 
+def sort_review_queue_dependencies(queue: list) -> list:
+    """Sort pending dependency-aware suggestions before parents; pure helper."""
+    def _key(item):
+        deps = item.get("depends_on_pending_suggestions") or []
+        dep_count = len(deps) if isinstance(deps, list) else 0
+        try:
+            level = int(item.get("dependency_level", 0) or 0)
+        except Exception:
+            level = 0
+        return (1 if dep_count else 0, level, dep_count, item.get("timestamp", ""))
+    return sorted(queue or [], key=_key)
+
+
+def _dependency_lines(item: dict) -> list:
+    deps = item.get("depends_on_pending_suggestions") or []
+    lines = []
+    if isinstance(deps, list):
+        for dep in deps:
+            if isinstance(dep, dict):
+                lines.append("%s %s -> %s conf=%.2f status=%s" % (
+                    dep.get("ea", "?"), dep.get("idb_name", ""),
+                    dep.get("suggested_name", ""),
+                    float(dep.get("confidence", 0.0) or 0.0),
+                    dep.get("status", "pending_review")))
+            else:
+                lines.append(str(dep))
+    return lines
+
+
+def choose_dependency_apply_action(item: dict) -> str:
+    """
+    Return apply_dependencies_first | apply_only | cancel.
+    In tests/non-IDA this safely defaults to cancel for dependency-bearing parents.
+    """
+    lines = _dependency_lines(item)
+    if not lines:
+        return "apply_only"
+    if not _IN_IDA:
+        return "cancel"
+    msg = (
+        "This suggestion depends on pending child rename suggestions.\n\n"
+        + "\n".join(lines[:12])
+        + "\n\nApply dependencies first?\n"
+        "Yes = apply dependencies first\nNo = apply only this item\nCancel = cancel"
+    )
+    try:
+        ans = idaapi.ask_yn(idaapi.ASKBTN_CANCEL, msg)
+        if ans == idaapi.ASKBTN_YES:
+            return "apply_dependencies_first"
+        if ans == idaapi.ASKBTN_NO:
+            return "apply_only"
+    except Exception:
+        pass
+    return "cancel"
+
+
+def _find_pending_dependency_items(parent_item: dict) -> list:
+    deps = parent_item.get("depends_on_pending_suggestions") or []
+    wanted = set()
+    if isinstance(deps, list):
+        for dep in deps:
+            if isinstance(dep, dict):
+                wanted.add((str(dep.get("ea", "")).lower(), dep.get("suggested_name", "")))
+    if not wanted:
+        return []
+    matches = []
+    for q in load_review_queue():
+        key = (str(q.get("ea", "")).lower(), q.get("suggested_name", ""))
+        if q.get("status") == "pending" and key in wanted:
+            matches.append(q)
+    return sort_review_queue_dependencies(matches)
+
+
 def apply_queue_item(item: dict) -> bool:
     """
     Apply one review queue item (rename + comment).
@@ -202,6 +280,29 @@ def apply_queue_item(item: dict) -> bool:
                 log.ok("Prototype applied at %s" % hex(ea))
                 return True
             return False
+
+        dep_action = choose_dependency_apply_action(item)
+        if dep_action == "cancel":
+            log.warn("Apply cancelled: parent suggestion depends on pending child suggestions.")
+            return False
+        if dep_action == "apply_dependencies_first":
+            dep_items = _find_pending_dependency_items(item)
+            applied_deps = 0
+            for dep_item in dep_items:
+                if _same_queue_item(dep_item, item):
+                    continue
+                if apply_queue_item(dep_item):
+                    applied_deps += 1
+                    _update_queue_status(dep_item, "applied")
+            if applied_deps < len(dep_items) and _IN_IDA:
+                try:
+                    ans = idaapi.ask_yn(idaapi.ASKBTN_NO,
+                        "Only %d/%d dependencies applied. Apply parent anyway?" % (
+                            applied_deps, len(dep_items)))
+                    if ans != idaapi.ASKBTN_YES:
+                        return False
+                except Exception:
+                    return False
 
         name = item["suggested_name"]
         applied = safe_apply_name(ea, name)
@@ -263,7 +364,7 @@ def show_review_queue_ui():
         log.warn("Review queue UI requires IDA.")
         return
 
-    pending = [q for q in load_review_queue() if q.get("status") == "pending"]
+    pending = sort_review_queue_dependencies([q for q in load_review_queue() if q.get("status") == "pending"])
     if not pending:
         idaapi.info("Review Queue is empty.\nNo pending AI suggestions.")
         return
