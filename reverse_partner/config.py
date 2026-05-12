@@ -59,6 +59,31 @@ DEFAULT_CONFIG: dict = {
     "keys_file":      "",
     "retry_failed":   True,
     "export_html":    True,
+    # Rename All ordering
+    "rename_order":                      "best_effort_bottom_up",
+    "strict_refresh_context_after_level": True,
+    "strict_pause_for_review":           True,
+    "strict_process_cycles_last":        True,
+    "strict_level_batch_size":           40,
+    "strict_second_pass_parent_refine":  False,
+    # Proposal-aware bottom-up context
+    "proposal_use_pending_child_names":     True,
+    "proposal_propagate_child_confidence":  True,
+    "proposal_dependency_review_sort":      True,
+    "proposal_max_parent_confidence_boost": 0.10,
+    # Rename All request budgeting
+    "request_budget_mode":                  "free_key_balanced",
+    "max_ai_requests_per_run":              25,
+    "max_functions_per_rename_run":         250,
+    "target_functions_per_request":         40,
+    "max_functions_per_request":            60,
+    "min_functions_per_request":            8,
+    "proposal_level_batch_size":            50,
+    "warn_if_estimated_requests_above":     25,
+    "allow_user_to_reduce_scope_on_budget_exceed": True,
+    "prefer_cache_before_budget_count":     True,
+    "max_retry_requests_per_run":           5,
+    "retry_batch_shrink_factor":            2,
     # Naming policy
     "naming_mode":    "conservative",  # conservative | malware | blog
     # Review queue
