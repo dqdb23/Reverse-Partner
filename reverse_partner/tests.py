@@ -462,6 +462,477 @@ def test_spa_summary_accounting():
     check("spa_summary_static_count", summary["static_only"], 2)
 
 
+def test_strict_compute_bottom_up_levels_simple_chain():
+    from rename_engine import build_candidate_call_graph, compute_bottom_up_levels
+    candidates = [
+        {"ea": 1, "callee_eas": [2]},
+        {"ea": 2, "callee_eas": [3]},
+        {"ea": 3, "callee_eas": []},
+    ]
+    graph = build_candidate_call_graph(candidates)
+    plan = compute_bottom_up_levels(candidates, graph)
+    check("strict_chain_levels", plan["levels"], [[3], [2], [1]])
+
+
+def test_strict_compute_bottom_up_levels_branching():
+    from rename_engine import build_candidate_call_graph, compute_bottom_up_levels
+    candidates = [
+        {"ea": 1, "callee_eas": [2, 3]},
+        {"ea": 2, "callee_eas": []},
+        {"ea": 3, "callee_eas": []},
+    ]
+    plan = compute_bottom_up_levels(candidates, build_candidate_call_graph(candidates))
+    check("strict_branch_leaf_level", plan["levels"][0], [2, 3])
+    check("strict_branch_parent_level", plan["levels"][1], [1])
+
+
+def test_strict_diamond_and_external_ignored():
+    from rename_engine import build_candidate_call_graph, compute_bottom_up_levels
+    candidates = [
+        {"ea": 1, "callee_eas": [2, 3, 999]},
+        {"ea": 2, "callee_eas": [4]},
+        {"ea": 3, "callee_eas": [4]},
+        {"ea": 4, "callee_eas": []},
+        {"ea": 5, "callee_eas": [999]},
+    ]
+    graph = build_candidate_call_graph(candidates)
+    plan = compute_bottom_up_levels(candidates, graph)
+    check_true("strict_external_ignored", 999 not in graph[1] and 999 not in graph[5])
+    check("strict_diamond_level0", plan["levels"][0], [4, 5])
+    check("strict_diamond_level1", plan["levels"][1], [2, 3])
+    check("strict_diamond_level2", plan["levels"][2], [1])
+
+
+def test_strict_batches_do_not_mix_parent_child():
+    from rename_engine import plan_strict_bottom_up_batches
+    candidates = [
+        {"ea": 1, "callee_eas": [2]},
+        {"ea": 2, "callee_eas": [3]},
+        {"ea": 3, "callee_eas": []},
+    ]
+    planned = plan_strict_bottom_up_batches(candidates, {"strict_level_batch_size": 10})
+    batches = [g["batches"] for g in planned["groups"]]
+    check("strict_no_parent_child_batch0", batches[0], [[3]])
+    check("strict_no_parent_child_batch1", batches[1], [[2]])
+    check("strict_no_parent_child_batch2", batches[2], [[1]])
+
+
+def test_strict_cycle_group_processed_last():
+    from rename_engine import build_candidate_call_graph, compute_bottom_up_levels, plan_strict_bottom_up_batches
+    candidates = [
+        {"ea": 1, "callee_eas": [2]},
+        {"ea": 2, "callee_eas": [1]},
+        {"ea": 3, "callee_eas": []},
+    ]
+    graph = build_candidate_call_graph(candidates)
+    plan = compute_bottom_up_levels(candidates, graph)
+    planned = plan_strict_bottom_up_batches(candidates, {"strict_level_batch_size": 10}, graph)
+    check("strict_cycle_acyclic_first", plan["levels"], [[3]])
+    check("strict_cycle_group", plan["cycle_groups"], [[1, 2]])
+    check_true("strict_cycle_last", planned["groups"][-1]["is_cycle"])
+
+
+def test_strict_disconnected_functions_same_leaf_level():
+    from rename_engine import build_candidate_call_graph, compute_bottom_up_levels
+    candidates = [
+        {"ea": 10, "callee_eas": []},
+        {"ea": 20, "callee_eas": []},
+        {"ea": 30, "callee_eas": []},
+    ]
+    plan = compute_bottom_up_levels(candidates, build_candidate_call_graph(candidates))
+    check("strict_disconnected", plan["levels"], [[10, 20, 30]])
+
+
+def test_strict_refresh_context_called_per_level():
+    from rename_engine import execute_strict_bottom_up_plan
+    candidates = [{"ea": 1, "callee_eas": [2]}, {"ea": 2, "callee_eas": []}]
+    calls = []
+    def refresh(ea, cfg):
+        calls.append(ea)
+        return {"ea": ea, "name": "sub_%x" % ea}
+    def send(batch, level):
+        return {item["name"]: {"name": "ren_%x" % item["ea"]} for item in batch}
+    def apply_item(item, result):
+        return "applied"
+    result = execute_strict_bottom_up_plan(
+        candidates, {"rename_order": "strict_bottom_up", "review_mode": False, "strict_level_batch_size": 10},
+        send, apply_item, refresh)
+    check("strict_refresh_order", calls, [2, 1])
+    check_true("strict_refresh_not_paused", not result["paused"])
+
+
+def test_strict_review_mode_pauses_after_level():
+    from rename_engine import execute_strict_bottom_up_plan
+    candidates = [{"ea": 1, "callee_eas": [2]}, {"ea": 2, "callee_eas": []}]
+    sent = []
+    def refresh(ea, cfg):
+        return {"ea": ea, "name": "sub_%x" % ea}
+    def send(batch, level):
+        sent.extend(item["ea"] for item in batch)
+        return {item["name"]: {"name": "queued_%x" % item["ea"]} for item in batch}
+    def apply_item(item, result):
+        return "queued"
+    result = execute_strict_bottom_up_plan(
+        candidates, {"rename_order": "strict_bottom_up", "review_mode": True, "strict_pause_for_review": True},
+        send, apply_item, refresh)
+    check("strict_review_sent_only_child", sent, [2])
+    check_true("strict_review_paused", result["paused"])
+    check("strict_review_paused_level", result["paused_level"], 0)
+
+
+def test_strict_non_review_mode_applies_before_next_level():
+    from rename_engine import execute_strict_bottom_up_plan
+    candidates = [{"ea": 1, "callee_eas": [2]}, {"ea": 2, "callee_eas": []}]
+    events = []
+    def refresh(ea, cfg):
+        events.append(("refresh", ea))
+        return {"ea": ea, "name": "sub_%x" % ea}
+    def send(batch, level):
+        events.append(("send", [item["ea"] for item in batch]))
+        return {item["name"]: {"name": "ren_%x" % item["ea"]} for item in batch}
+    def apply_item(item, result):
+        events.append(("apply", item["ea"]))
+        return "applied"
+    execute_strict_bottom_up_plan(
+        candidates, {"rename_order": "strict_bottom_up", "review_mode": False},
+        send, apply_item, refresh)
+    check("strict_non_review_sequence", events, [
+        ("refresh", 2), ("send", [2]), ("apply", 2),
+        ("refresh", 1), ("send", [1]), ("apply", 1),
+    ])
+
+
+def test_best_effort_mode_unchanged():
+    from rename_engine import execute_strict_bottom_up_plan
+    called = []
+    result = execute_strict_bottom_up_plan(
+        [{"ea": 1, "callee_eas": []}],
+        {"rename_order": "best_effort_bottom_up"},
+        lambda batch, level: called.append("send"),
+        lambda item, result: called.append("apply"),
+        lambda ea, cfg: called.append("refresh"))
+    check("best_effort_mode", result["mode"], "best_effort_bottom_up")
+    check("best_effort_no_callbacks", called, [])
+
+
+def test_proposal_pending_child_context_in_parent():
+    from rename_engine import build_pending_child_context
+    virtual = {2: {"idb_name": "sub_2", "suggested_name": "xor_transform_buffer",
+                   "confidence": 0.92, "status": "pending_review",
+                   "evidence": ["XOR loop over byte buffer"], "level": 0}}
+    text, deps = build_pending_child_context(1, virtual, {1: {2}})
+    check_true("proposal_context_has_label", "tentative" in text and "not ground truth" in text)
+    check_true("proposal_context_has_child", "xor_transform_buffer" in text and "sub_2" in text)
+    check("proposal_context_dep", deps[0]["suggested_name"], "xor_transform_buffer")
+
+
+def test_proposal_parent_confidence_capped_and_records_deps():
+    from rename_engine import apply_proposal_confidence_metadata
+    deps = [{"ea": "0x2", "suggested_name": "child", "confidence": 0.5}]
+    result = apply_proposal_confidence_metadata({"name": "parent", "confidence": 0.95}, deps,
+                                                {"proposal_propagate_child_confidence": True}, 1)
+    check("proposal_conf_capped", result["confidence"], 0.8)
+    check_true("proposal_records_deps", bool(result["depends_on_pending_suggestions"]))
+    check("proposal_child_support", result["child_support_confidence"], 0.5)
+
+
+def test_review_queue_sorts_child_before_parent():
+    from review_queue import sort_review_queue_dependencies
+    parent = {"ea": "0x1", "suggested_name": "parent", "dependency_level": 1,
+              "depends_on_pending_suggestions": [{"ea": "0x2"}], "timestamp": "b"}
+    child = {"ea": "0x2", "suggested_name": "child", "dependency_level": 0,
+             "depends_on_pending_suggestions": [], "timestamp": "a"}
+    ordered = sort_review_queue_dependencies([parent, child])
+    check("review_dep_child_first", ordered[0]["ea"], "0x2")
+
+
+def test_apply_parent_before_child_warns_non_ida():
+    from review_queue import choose_dependency_apply_action
+    action = choose_dependency_apply_action({"depends_on_pending_suggestions": [{"ea": "0x2"}]})
+    check("review_dep_non_ida_cancel", action, "cancel")
+
+
+def test_request_estimation_best_effort():
+    from rename_engine import estimate_rename_requests
+    candidates = [{"ea": i, "_cached": False} for i in range(95)]
+    est = estimate_rename_requests(candidates, {"batch_size": 50, "max_ai_requests_per_run": 25}, "best_effort_bottom_up")
+    check("estimate_best_effort_reqs", est["estimated_requests"], 2)
+    check("estimate_best_effort_uncached", est["estimated_uncached_functions"], 95)
+
+
+def test_request_estimation_strict_levels():
+    from rename_engine import estimate_rename_requests, build_candidate_call_graph
+    candidates = [{"ea": 1, "callee_eas": [2]}, {"ea": 2, "callee_eas": []}, {"ea": 3, "callee_eas": []}]
+    graph = build_candidate_call_graph(candidates)
+    est = estimate_rename_requests(candidates, {"strict_level_batch_size": 40, "target_functions_per_request": 40},
+                                   "strict_bottom_up", graph)
+    check("estimate_strict_levels", est["levels"], 2)
+    check("estimate_strict_reqs", est["estimated_requests"], 2)
+
+
+def test_request_estimation_proposal_levels():
+    from rename_engine import estimate_rename_requests, build_candidate_call_graph
+    candidates = [{"ea": 1, "callee_eas": [2]}, {"ea": 2, "callee_eas": []}, {"ea": 3, "callee_eas": []}]
+    graph = build_candidate_call_graph(candidates)
+    est = estimate_rename_requests(candidates, {"proposal_level_batch_size": 50, "target_functions_per_request": 40},
+                                   "proposal_aware_bottom_up", graph)
+    check("estimate_proposal_levels", est["levels"], 2)
+    check("estimate_proposal_reqs", est["estimated_requests"], 2)
+
+
+def test_same_level_batching_uses_large_batches():
+    from rename_engine import plan_strict_bottom_up_batches
+    candidates = [{"ea": i, "callee_eas": []} for i in range(93)]
+    planned = plan_strict_bottom_up_batches(candidates, {"rename_order": "proposal_aware_bottom_up",
+                                                         "proposal_level_batch_size": 40,
+                                                         "target_functions_per_request": 40,
+                                                         "max_functions_per_request": 60})
+    sizes = [len(b) for b in planned["groups"][0]["batches"]]
+    check("same_level_large_batches", sizes, [40, 40, 13])
+
+
+def test_cache_hits_reduce_estimated_request_count():
+    from rename_engine import estimate_rename_requests
+    candidates = [{"ea": i, "_cached": (i < 50)} for i in range(100)]
+    est = estimate_rename_requests(candidates, {"batch_size": 50, "prefer_cache_before_budget_count": True},
+                                   "best_effort_bottom_up")
+    check("cache_hits_estimated", est["estimated_cached"], 50)
+    check("cache_hits_requests", est["estimated_requests"], 1)
+
+
+def test_budget_exceeded_warning_plan():
+    from rename_engine import budget_exceeded_plan
+    plan = budget_exceeded_plan({"estimated_requests": 30}, {"max_ai_requests_per_run": 25})
+    check_true("budget_plan_exceeded", plan["budget_exceeded"])
+    check_true("budget_plan_options", "reduce_scope" in plan["options"])
+
+
+def test_reduce_scope_respects_max_functions_per_run():
+    from rename_engine import reduce_scope_for_budget
+    candidates = [{"ea": i, "callee_eas": [], "pre_tags": ["FILE"] if i % 2 else []} for i in range(300)]
+    reduced = reduce_scope_for_budget(candidates, {"max_functions_per_rename_run": 250})
+    check("reduce_scope_limit", len(reduced), 250)
+
+
+def test_retry_only_missing_functions():
+    from rename_engine import plan_retry_batches
+    missing = [{"ea": i} for i in range(9)]
+    batches = plan_retry_batches(missing, {"target_functions_per_request": 8,
+                                           "max_functions_per_request": 8,
+                                           "retry_batch_shrink_factor": 2,
+                                           "max_retry_requests_per_run": 2})
+    check("retry_missing_batches", [len(b) for b in batches], [4, 4])
+
+
+def test_proposal_aware_no_review_pause_fewer_requests_than_strict_pause():
+    from rename_engine import execute_strict_bottom_up_plan, estimate_rename_requests, build_candidate_call_graph
+    candidates = [{"ea": 1, "callee_eas": [2]}, {"ea": 2, "callee_eas": []}]
+    sent = []
+    def refresh(ea, cfg): return {"ea": ea, "name": "sub_%x" % ea}
+    def send(batch, level):
+        sent.extend(item["ea"] for item in batch)
+        return {item["name"]: {"name": "x"} for item in batch}
+    def apply_item(item, result): return "queued"
+    strict = execute_strict_bottom_up_plan(candidates, {"rename_order": "strict_bottom_up", "review_mode": True,
+                                                        "strict_pause_for_review": True}, send, apply_item, refresh)
+    graph = build_candidate_call_graph(candidates)
+    proposal_est = estimate_rename_requests(candidates, {"proposal_level_batch_size": 50},
+                                            "proposal_aware_bottom_up", graph)
+    check_true("strict_pauses", strict["paused"])
+    check("proposal_full_estimate", proposal_est["estimated_requests"], 2)
+
+
+def test_config_missing_rename_order_default():
+    import config
+    migrated = config._migrate({})
+    check("config_missing_rename_order", migrated["rename_order"], "best_effort_bottom_up")
+
+
+def test_config_invalid_rename_order_fallback():
+    import config
+    migrated = config._migrate({"rename_order": "bad_mode"})
+    check("config_invalid_rename_order", migrated["rename_order"], "best_effort_bottom_up")
+
+
+def test_config_proposal_and_strict_preserved_save_load():
+    import os, tempfile, config
+    old_path = config._config_path
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        config._config_path = lambda: path
+        cfg = config.DEFAULT_CONFIG.copy()
+        cfg["rename_order"] = "proposal_aware_bottom_up"
+        config.save_config(cfg)
+        check("config_proposal_preserved", config.load_config()["rename_order"], "proposal_aware_bottom_up")
+        cfg["rename_order"] = "strict_bottom_up"
+        config.save_config(cfg)
+        check("config_strict_preserved", config.load_config()["rename_order"], "strict_bottom_up")
+    finally:
+        config._config_path = old_path
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def test_queue_selected_child_parent_sorted_child_first():
+    from review_queue import prepare_apply_selected_items
+    child = {"kind": "function_rename", "ea": "0x2", "suggested_name": "child", "status": "pending", "dependency_level": 0}
+    parent = {"kind": "function_rename", "ea": "0x1", "suggested_name": "parent", "status": "pending", "dependency_level": 1,
+              "depends_on_pending_suggestions": [{"ea": "0x2", "suggested_name": "child"}]}
+    items, plan = prepare_apply_selected_items([parent, child], [parent, child], "selected_only")
+    check("queue_apply_order_child_first", [i["ea"] for i in items], ["0x2", "0x1"])
+    check("queue_apply_no_missing", plan["parents_with_missing"], 0)
+
+
+def test_queue_reject_selected_only_pending():
+    from review_queue import reject_selected_in_queue
+    a = {"kind": "function_rename", "ea": "0x1", "suggested_name": "a", "status": "pending"}
+    b = {"kind": "function_rename", "ea": "0x2", "suggested_name": "b", "status": "pending"}
+    c = {"kind": "function_rename", "ea": "0x3", "suggested_name": "c", "status": "applied"}
+    updated, summary = reject_selected_in_queue([a, b, c], [a, c])
+    check("queue_reject_count", summary["rejected"], 1)
+    check("queue_reject_selected", updated[0]["status"], "rejected")
+    check("queue_reject_unselected_unchanged", updated[1]["status"], "pending")
+    check("queue_reject_applied_unchanged", updated[2]["status"], "applied")
+
+
+def test_queue_missing_dependency_plan_and_selected_child_no_warn():
+    from review_queue import missing_dependency_plan
+    child = {"kind": "function_rename", "ea": "0x2", "suggested_name": "child", "status": "pending"}
+    parent = {"kind": "function_rename", "ea": "0x1", "suggested_name": "parent", "status": "pending",
+              "depends_on_pending_suggestions": [{"ea": "0x2", "suggested_name": "child"}]}
+    missing = missing_dependency_plan([parent], [parent, child])
+    check("queue_missing_parent_count", missing["parents_with_missing"], 1)
+    check("queue_missing_dep", missing["missing_dependencies"][0]["ea"], "0x2")
+    none = missing_dependency_plan([parent, child], [parent, child])
+    check("queue_selected_child_no_missing", none["parents_with_missing"], 0)
+
+
+def test_queue_apply_selected_dependency_order_with_mock():
+    import review_queue
+    child = {"kind": "function_rename", "ea": "0x2", "suggested_name": "child", "status": "pending", "dependency_level": 0}
+    parent = {"kind": "function_rename", "ea": "0x1", "suggested_name": "parent", "status": "pending", "dependency_level": 1,
+              "depends_on_pending_suggestions": [{"ea": "0x2", "suggested_name": "child"}]}
+    calls = []
+    old_load, old_save = review_queue.load_review_queue, review_queue.save_review_queue
+    try:
+        review_queue.load_review_queue = lambda: [parent, child]
+        review_queue.save_review_queue = lambda q: None
+        def fake_apply(item, dep_action=None):
+            calls.append(item["ea"])
+            return True
+        summary = review_queue.apply_selected_queue_items([parent, child], [parent, child], "selected_only", fake_apply)
+        check("queue_apply_mock_order", calls, ["0x2", "0x1"])
+        check("queue_apply_mock_applied", summary["applied"], 2)
+    finally:
+        review_queue.load_review_queue = old_load
+        review_queue.save_review_queue = old_save
+
+
+def test_queue_bulk_high_confidence_filters_threshold():
+    from review_queue import high_confidence_pending_items
+    hi = {"kind": "function_rename", "ea": "0x1", "suggested_name": "hi", "confidence": 0.9, "status": "pending"}
+    low = {"kind": "function_rename", "ea": "0x2", "suggested_name": "low", "confidence": 0.5, "status": "pending"}
+    var = {"kind": "variable_rename", "ea": "0x3", "new_var": "v", "confidence": 0.99, "status": "pending"}
+    applied = {"kind": "function_rename", "ea": "0x4", "suggested_name": "done", "confidence": 0.99, "status": "applied"}
+    items = high_confidence_pending_items([low, hi, var, applied], 0.85)
+    check("queue_bulk_high_only", [i["suggested_name"] for i in items], ["hi"])
+
+
+def test_queue_dependency_metadata_preserved_save_load():
+    import review_queue
+    old_load, old_save = review_queue.load_review_queue, review_queue.save_review_queue
+    stored = []
+    try:
+        review_queue.load_review_queue = lambda: []
+        review_queue.save_review_queue = lambda q: stored.extend(q)
+        review_queue.add_to_review_queue(0x1, "sub_1", {
+            "name": "parent", "confidence": 0.7,
+            "depends_on_pending_suggestions": [{"ea": "0x2", "suggested_name": "child"}],
+            "confidence_adjustment": {"original": 0.9, "final": 0.7},
+            "dependency_level": 1,
+            "child_support_confidence": 0.25,
+        }, "model", "provider")
+        check_true("queue_dep_meta_saved", bool(stored[0].get("depends_on_pending_suggestions")))
+        check("queue_dep_level_saved", stored[0].get("dependency_level"), 1)
+    finally:
+        review_queue.load_review_queue = old_load
+        review_queue.save_review_queue = old_save
+
+
+def test_queue_get_selected_items_maps_visible_indexes():
+    from review_queue import get_selected_queue_items
+    class FakeChooser:
+        def __init__(self):
+            self.items = [
+                {"ea": "0x1", "status": "pending"},
+                {"ea": "0x2", "status": "applied"},
+                {"ea": "0x3", "status": "pending"},
+            ]
+            self.selected_indexes = [0, 1, 2, 99]
+    selected = get_selected_queue_items(FakeChooser())
+    check("queue_selected_index_map", [i["ea"] for i in selected], ["0x1", "0x3"])
+
+
+def test_queue_apply_selected_uses_only_selected_items():
+    import review_queue
+    a = {"kind": "function_rename", "ea": "0x1", "suggested_name": "a", "status": "pending"}
+    b = {"kind": "function_rename", "ea": "0x2", "suggested_name": "b", "status": "pending"}
+    calls = []
+    old_load, old_save = review_queue.load_review_queue, review_queue.save_review_queue
+    try:
+        review_queue.load_review_queue = lambda: [a, b]
+        review_queue.save_review_queue = lambda q: None
+        summary = review_queue.apply_selected_queue_items([a], [a, b], "selected_only",
+                                                          lambda item, dep_action=None: calls.append(item["ea"]) or True)
+        check("queue_apply_only_selected_calls", calls, ["0x1"])
+        check("queue_apply_only_selected_requested", summary["requested"], 1)
+    finally:
+        review_queue.load_review_queue = old_load
+        review_queue.save_review_queue = old_save
+
+
+def test_queue_apply_selected_ignores_applied_rejected():
+    import review_queue
+    pending = {"kind": "function_rename", "ea": "0x1", "suggested_name": "a", "status": "pending"}
+    applied = {"kind": "function_rename", "ea": "0x2", "suggested_name": "b", "status": "applied"}
+    rejected = {"kind": "function_rename", "ea": "0x3", "suggested_name": "c", "status": "rejected"}
+    calls = []
+    old_load, old_save = review_queue.load_review_queue, review_queue.save_review_queue
+    try:
+        review_queue.load_review_queue = lambda: [pending, applied, rejected]
+        review_queue.save_review_queue = lambda q: None
+        summary = review_queue.apply_selected_queue_items([pending, applied, rejected], [pending, applied, rejected],
+                                                          "selected_only",
+                                                          lambda item, dep_action=None: calls.append(item["ea"]) or True)
+        check("queue_apply_ignores_done_calls", calls, ["0x1"])
+        check("queue_apply_ignores_done_requested", summary["requested"], 1)
+    finally:
+        review_queue.load_review_queue = old_load
+        review_queue.save_review_queue = old_save
+
+
+def test_queue_status_update_preserves_dependency_metadata():
+    import review_queue
+    item = {"kind": "function_rename", "ea": "0x1", "suggested_name": "parent", "status": "pending",
+            "depends_on_pending_suggestions": [{"ea": "0x2", "suggested_name": "child"}],
+            "confidence_adjustment": {"original": 0.9, "final": 0.7}}
+    saved = []
+    old_load, old_save = review_queue.load_review_queue, review_queue.save_review_queue
+    try:
+        review_queue.load_review_queue = lambda: [dict(item)]
+        review_queue.save_review_queue = lambda q: saved.extend(q)
+        review_queue._update_queue_status(item, "applied")
+        check("queue_status_meta_status", saved[0]["status"], "applied")
+        check_true("queue_status_meta_deps", bool(saved[0].get("depends_on_pending_suggestions")))
+        check("queue_status_meta_conf", saved[0]["confidence_adjustment"]["final"], 0.7)
+    finally:
+        review_queue.load_review_queue = old_load
+        review_queue.save_review_queue = old_save
+
+
 # ---------------------------------------------------------------------------
 
 def run_all():
@@ -493,6 +964,42 @@ def run_all():
         test_spa_artifact_path_and_child_truncation,
         test_spa_priority_sorting,
         test_spa_summary_accounting,
+        test_strict_compute_bottom_up_levels_simple_chain,
+        test_strict_compute_bottom_up_levels_branching,
+        test_strict_diamond_and_external_ignored,
+        test_strict_batches_do_not_mix_parent_child,
+        test_strict_cycle_group_processed_last,
+        test_strict_disconnected_functions_same_leaf_level,
+        test_strict_refresh_context_called_per_level,
+        test_strict_review_mode_pauses_after_level,
+        test_strict_non_review_mode_applies_before_next_level,
+        test_best_effort_mode_unchanged,
+        test_proposal_pending_child_context_in_parent,
+        test_proposal_parent_confidence_capped_and_records_deps,
+        test_review_queue_sorts_child_before_parent,
+        test_apply_parent_before_child_warns_non_ida,
+        test_request_estimation_best_effort,
+        test_request_estimation_strict_levels,
+        test_request_estimation_proposal_levels,
+        test_same_level_batching_uses_large_batches,
+        test_cache_hits_reduce_estimated_request_count,
+        test_budget_exceeded_warning_plan,
+        test_reduce_scope_respects_max_functions_per_run,
+        test_retry_only_missing_functions,
+        test_proposal_aware_no_review_pause_fewer_requests_than_strict_pause,
+        test_config_missing_rename_order_default,
+        test_config_invalid_rename_order_fallback,
+        test_config_proposal_and_strict_preserved_save_load,
+        test_queue_selected_child_parent_sorted_child_first,
+        test_queue_reject_selected_only_pending,
+        test_queue_missing_dependency_plan_and_selected_child_no_warn,
+        test_queue_apply_selected_dependency_order_with_mock,
+        test_queue_bulk_high_confidence_filters_threshold,
+        test_queue_dependency_metadata_preserved_save_load,
+        test_queue_get_selected_items_maps_visible_indexes,
+        test_queue_apply_selected_uses_only_selected_items,
+        test_queue_apply_selected_ignores_applied_rejected,
+        test_queue_status_update_preserves_dependency_metadata,
     ]
 
     import io

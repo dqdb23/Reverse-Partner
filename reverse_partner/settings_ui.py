@@ -10,6 +10,7 @@ import re
 from config import (
     load_config, save_config, load_keys_from_file, mask_key,
     VALID_PROVIDERS, VALID_NAMING_MODES, DEFAULT_MODEL_MAP,
+    VALID_RENAME_ORDERS, normalize_rename_order,
 )
 from logger import log
 
@@ -56,6 +57,100 @@ def _ask(label: str, default: str) -> str:
         return default
     result = idaapi.ask_str(default, 0, label)
     return result.strip() if result is not None else default
+
+
+def _ask_int(label: str, current: int, minimum: int = 0) -> int:
+    raw = _ask(label, str(current))
+    try:
+        return max(minimum, int(raw))
+    except (TypeError, ValueError):
+        if _IN_IDA:
+            idaapi.warning("Invalid integer; keeping %d." % current)
+        return max(minimum, int(current))
+
+
+def _ask_rename_order(current: str) -> str:
+    current = normalize_rename_order(current)
+    raw = _ask(
+        "Settings [8/11] — Rename All order\n\n"
+        "1. Best-effort bottom-up (best_effort_bottom_up)\n"
+        "   Fast default mode. Uses call graph sorting where possible, but does not strictly block parents.\n\n"
+        "2. Strict bottom-up (strict_bottom_up)\n"
+        "   Processes callees/children before callers/parents. May require multiple review/apply passes when review_mode=true.\n\n"
+        "3. Proposal-aware bottom-up (proposal_aware_bottom_up)\n"
+        "   Child levels first; parent prompts use pending child suggestions as tentative context.\n"
+        "   Recommended with review_mode=true. Parent confidence is capped when it depends on pending child suggestions.\n\n"
+        "Enter 1, 2, 3, or internal value:",
+        current)
+    lookup = {
+        "1": "best_effort_bottom_up",
+        "2": "strict_bottom_up",
+        "3": "proposal_aware_bottom_up",
+    }
+    value = lookup.get(str(raw).strip(), str(raw).strip().lower())
+    if value not in VALID_RENAME_ORDERS:
+        log.warn("Invalid rename_order '%s' selected; using best_effort_bottom_up." % value)
+        if _IN_IDA:
+            idaapi.warning("Invalid Rename All order; using Best-effort bottom-up.")
+        return "best_effort_bottom_up"
+    return value
+
+
+def _ask_advanced_rename_all(cfg: dict) -> dict:
+    if not _yn(
+            "Settings [9/11] — Advanced Rename All options\n\n"
+            "Configure proposal-aware context and request budgeting?\n\n"
+            "YES = edit advanced Rename All settings\n"
+            "NO  = keep current values",
+            False):
+        return {
+            "proposal_use_pending_child_names": cfg.get("proposal_use_pending_child_names", True),
+            "proposal_propagate_child_confidence": cfg.get("proposal_propagate_child_confidence", True),
+            "proposal_dependency_review_sort": cfg.get("proposal_dependency_review_sort", True),
+            "proposal_level_batch_size": cfg.get("proposal_level_batch_size", 50),
+            "max_ai_requests_per_run": cfg.get("max_ai_requests_per_run", 25),
+            "target_functions_per_request": cfg.get("target_functions_per_request", 40),
+            "max_functions_per_request": cfg.get("max_functions_per_request", 60),
+            "max_retry_requests_per_run": cfg.get("max_retry_requests_per_run", 5),
+        }
+
+    proposal_use = _yn(
+        "Advanced Rename All — Pending child names\n\n"
+        "YES = proposal-aware parent prompts include pending child suggestions as tentative context",
+        cfg.get("proposal_use_pending_child_names", True))
+    proposal_conf = _yn(
+        "Advanced Rename All — Propagate child confidence\n\n"
+        "YES = cap parent confidence when parent depends on pending child suggestions",
+        cfg.get("proposal_propagate_child_confidence", True))
+    proposal_sort = _yn(
+        "Advanced Rename All — Dependency review sort\n\n"
+        "YES = show child/dependency-free Review Queue items before dependent parents",
+        cfg.get("proposal_dependency_review_sort", True))
+
+    proposal_batch = _ask_int("Advanced Rename All — Proposal level batch size (>=1):",
+                              cfg.get("proposal_level_batch_size", 50), 1)
+    max_req = _ask_int("Advanced Rename All — Max AI requests per run (>=1):",
+                       cfg.get("max_ai_requests_per_run", 25), 1)
+    target = _ask_int("Advanced Rename All — Target functions per request (>=1):",
+                      cfg.get("target_functions_per_request", 40), 1)
+    max_per = _ask_int("Advanced Rename All — Max functions per request (>= target):",
+                       cfg.get("max_functions_per_request", 60), 1)
+    if max_per < target:
+        max_per = target
+        if _IN_IDA:
+            idaapi.warning("Max functions/request was below target; clamped to %d." % max_per)
+    max_retry = _ask_int("Advanced Rename All — Max retry requests per run (>=0):",
+                         cfg.get("max_retry_requests_per_run", 5), 0)
+    return {
+        "proposal_use_pending_child_names": proposal_use,
+        "proposal_propagate_child_confidence": proposal_conf,
+        "proposal_dependency_review_sort": proposal_sort,
+        "proposal_level_batch_size": proposal_batch,
+        "max_ai_requests_per_run": max_req,
+        "target_functions_per_request": target,
+        "max_functions_per_request": max_per,
+        "max_retry_requests_per_run": max_retry,
+    }
 
 
 def show_settings():
@@ -205,15 +300,19 @@ def show_settings():
     )
     prefix = re.sub(r"[^a-zA-Z0-9_]", "", prefix_raw.strip())
 
-    # ── [9] Struct inference + cache ──────────────────────────────────────
+    # ── [9] Rename All order + advanced options ───────────────────────────
+    rename_order = _ask_rename_order(cfg.get("rename_order", "best_effort_bottom_up"))
+    advanced_rename = _ask_advanced_rename_all(cfg)
+
+    # ── [10] Struct inference + cache ─────────────────────────────────────
     enable_struct = _yn(
-        "Settings [9/10] — Struct Inference\n\n"
+        "Settings [10/11] — Struct Inference\n\n"
         "YES = Infer struct layouts for functions with heavy field accesses\n"
         "NO  = Disable (faster)",
         cfg.get("enable_struct_inference", True)
     )
     enable_cache = _yn(
-        "Settings [9/10] — Analysis Cache\n\n"
+        "Settings [10/11] — Analysis Cache\n\n"
         "YES = Cache AI results to avoid repeated calls for unchanged functions\n"
         "NO  = Always call AI",
         cfg.get("enable_cache", True)
@@ -221,19 +320,19 @@ def show_settings():
 
     # ── [10] Misc ─────────────────────────────────────────────────────────
     skip_named   = _yn(
-        "Settings [10/10] — Skip Named Functions\n\n"
+        "Settings [11/11] — Skip Named Functions\n\n"
         "YES = Only rename sub_XXXX / default names\n"
         "NO  = Rename all functions",
         cfg.get("skip_named", True)
     )
     use_pseudo   = _yn(
-        "Settings [10/10] — Use Pseudocode\n\n"
+        "Settings [11/11] — Use Pseudocode\n\n"
         "YES = Use Hex-Rays decompiler output (more accurate)\n"
         "NO  = Use assembly only",
         cfg.get("use_pseudocode", True)
     )
     retry_failed = _yn(
-        "Settings [10/10] — Retry Failed\n\n"
+        "Settings [11/11] — Retry Failed\n\n"
         "YES = Single-call retry for functions that failed batch processing\n"
         "NO  = Skip failed functions",
         cfg.get("retry_failed", True)
@@ -251,6 +350,15 @@ def show_settings():
         "naming_mode":           naming_mode,
         "review_mode":           review_mode,
         "auto_apply_confidence": auto_conf,
+        "rename_order":          rename_order,
+        "proposal_use_pending_child_names": advanced_rename["proposal_use_pending_child_names"],
+        "proposal_propagate_child_confidence": advanced_rename["proposal_propagate_child_confidence"],
+        "proposal_dependency_review_sort": advanced_rename["proposal_dependency_review_sort"],
+        "proposal_level_batch_size": advanced_rename["proposal_level_batch_size"],
+        "max_ai_requests_per_run": advanced_rename["max_ai_requests_per_run"],
+        "target_functions_per_request": advanced_rename["target_functions_per_request"],
+        "max_functions_per_request": advanced_rename["max_functions_per_request"],
+        "max_retry_requests_per_run": advanced_rename["max_retry_requests_per_run"],
         "skip_named":            skip_named,
         "use_pseudocode":        use_pseudo,
         "retry_failed":          retry_failed,
@@ -268,4 +376,7 @@ def show_settings():
         naming_mode, review_mode, auto_conf))
     log.info("  Prefix   : '%s' | Struct: %s | Cache: %s" % (
         prefix, enable_struct, enable_cache))
+    log.info("  Rename order: %s | Max requests: %d | Target/request: %d" % (
+        rename_order, advanced_rename["max_ai_requests_per_run"],
+        advanced_rename["target_functions_per_request"]))
     log.sep()
