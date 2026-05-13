@@ -472,6 +472,246 @@ def high_confidence_pending_items(queue: list, threshold: float) -> list:
     ])
 
 
+_QUEUE_ACTIONS = (
+    ("reverse_partner:queue_apply_selected", "Apply selected", "apply_selected"),
+    ("reverse_partner:queue_reject_selected", "Reject selected", "reject_selected"),
+    ("reverse_partner:queue_apply_high_confidence", "Apply all high-confidence", "apply_high_confidence"),
+    ("reverse_partner:queue_refresh", "Refresh", "refresh"),
+)
+_QUEUE_ACTIONS_REGISTERED = False
+_ACTIVE_REVIEW_CHOOSER = None
+
+
+def _ctx_selection_indexes(ctx=None):
+    indexes = []
+    if ctx is None:
+        return indexes
+    for attr in ("chooser_selection", "selection", "selected", "sel"):
+        try:
+            value = getattr(ctx, attr, None)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        if isinstance(value, int):
+            indexes.append(value)
+        else:
+            try:
+                indexes.extend(int(x) for x in value)
+            except Exception:
+                pass
+        if indexes:
+            return indexes
+    try:
+        cur = getattr(ctx, "chooser_index", None)
+        if cur is not None:
+            indexes.append(int(cur))
+    except Exception:
+        pass
+    return indexes
+
+
+def _normalise_selection_indexes(indexes, size):
+    result = []
+    seen = set()
+    for idx in indexes or []:
+        try:
+            i = int(idx)
+        except Exception:
+            continue
+        # IDA APIs usually use 0-based chooser rows, but tolerate 1-based values
+        # if a plugin/SDK build reports them that way.
+        candidates = [i]
+        if i > 0:
+            candidates.append(i - 1)
+        for cand in candidates:
+            if 0 <= cand < size and cand not in seen:
+                seen.add(cand)
+                result.append(cand)
+                break
+    return result
+
+
+def get_selected_queue_items(chooser, ctx=None) -> list:
+    """Return selected pending items from chooser.items, not queue storage order."""
+    items = list(getattr(chooser, "items", []) or [])
+    raw_indexes = _ctx_selection_indexes(ctx)
+    if not raw_indexes:
+        try:
+            raw_indexes = list(getattr(chooser, "selected_indexes", []) or [])
+        except Exception:
+            raw_indexes = []
+    if not raw_indexes:
+        for meth in ("GetSelection", "get_selection", "GetSelected", "get_selected"):
+            try:
+                fn = getattr(chooser, meth, None)
+                if fn:
+                    raw_indexes = list(fn() or [])
+                    break
+            except Exception:
+                raw_indexes = []
+    indexes = _normalise_selection_indexes(raw_indexes, len(items))
+    if not indexes:
+        log.warn("Review Queue: unable to read multi-selection from chooser.")
+        return []
+    return [items[i] for i in indexes if items[i].get("status") == "pending"]
+
+
+def refresh_queue_chooser(chooser) -> int:
+    chooser.items = sort_review_queue_dependencies([
+        q for q in load_review_queue() if q.get("status") == "pending"
+    ])
+    chooser.selected_indexes = []
+    try:
+        chooser.Refresh()
+    except Exception:
+        try:
+            chooser.Show()
+        except Exception:
+            pass
+    return 1
+
+
+def _show_queue_summary(title, summary, extra=None):
+    if extra is None:
+        extra = []
+    lines = [title]
+    lines.extend(extra)
+    for key in ("requested", "applied", "rejected", "failed", "skipped"):
+        if key in summary:
+            label = "skipped/cancelled" if key == "skipped" else key
+            lines.append("- %s: %s" % (label, summary.get(key, 0)))
+    msg = "\n".join(lines)
+    log.info(msg.replace("\n", " | "))
+    if _IN_IDA:
+        idaapi.info(msg)
+
+
+def _queue_missing_action_for_ui(selected, queue):
+    plan = missing_dependency_plan(selected, queue)
+    if not plan.get("parents_with_missing"):
+        return "selected_only"
+    ans = idaapi.ask_yn(idaapi.ASKBTN_CANCEL,
+        "%d selected parent suggestion(s) depend on pending child suggestions that are not selected.\n\n"
+        "YES = include missing dependencies\n"
+        "NO = apply selected only\n"
+        "Cancel = do nothing" % plan.get("parents_with_missing", 0))
+    if ans == idaapi.ASKBTN_CANCEL:
+        return "cancel"
+    return "include_dependencies" if ans == idaapi.ASKBTN_YES else "selected_only"
+
+
+def _run_queue_popup_action(action_kind, chooser, ctx=None):
+    if chooser is None:
+        log.warn("Review Queue: no active chooser for popup action.")
+        return 1
+    if action_kind == "refresh":
+        refresh_queue_chooser(chooser)
+        return 1
+
+    if action_kind == "apply_selected":
+        selected = get_selected_queue_items(chooser, ctx)
+        if not selected:
+            log.warn("No queue items selected.")
+            if _IN_IDA:
+                idaapi.info("No queue items selected.")
+            return 1
+        missing_action = _queue_missing_action_for_ui(selected, load_review_queue())
+        if missing_action == "cancel":
+            return 1
+        summary = apply_selected_queue_items(selected, missing_action=missing_action)
+        if summary.get("applied", 0):
+            idaapi.refresh_idaview_anyway()
+        refresh_queue_chooser(chooser)
+        _show_queue_summary("Applied selected queue items:", summary)
+        return 1
+
+    if action_kind == "reject_selected":
+        selected = get_selected_queue_items(chooser, ctx)
+        if not selected:
+            log.warn("No queue items selected.")
+            if _IN_IDA:
+                idaapi.info("No queue items selected.")
+            return 1
+        ans = idaapi.ask_yn(idaapi.ASKBTN_NO,
+            "Reject %d selected suggestion(s)?" % len(selected))
+        if ans != idaapi.ASKBTN_YES:
+            return 1
+        summary = reject_selected_queue_items(selected)
+        refresh_queue_chooser(chooser)
+        _show_queue_summary("Rejected selected queue items:", summary)
+        return 1
+
+    if action_kind == "apply_high_confidence":
+        from config import load_config
+        cfg = load_config()
+        threshold = cfg.get("auto_apply_confidence", 0.85)
+        bulk_items = high_confidence_pending_items(load_review_queue(), threshold)
+        ans = idaapi.ask_yn(idaapi.ASKBTN_NO,
+            "Apply %d pending function rename item(s) with confidence ≥ %.2f?" % (
+                len(bulk_items), threshold))
+        if ans != idaapi.ASKBTN_YES:
+            return 1
+        summary = apply_selected_queue_items(bulk_items, missing_action="selected_only")
+        if summary.get("applied", 0):
+            idaapi.refresh_idaview_anyway()
+        refresh_queue_chooser(chooser)
+        _show_queue_summary("Bulk high-confidence apply:", summary,
+                            ["- threshold: %.2f" % threshold])
+        return 1
+    return 1
+
+
+def _register_queue_popup_actions():
+    global _QUEUE_ACTIONS_REGISTERED
+    if _QUEUE_ACTIONS_REGISTERED or not _IN_IDA or ida_kernwin is None:
+        return
+
+    handler_base = getattr(ida_kernwin, "action_handler_t", None) or getattr(idaapi, "action_handler_t")
+    desc_ctor = getattr(ida_kernwin, "action_desc_t", None) or getattr(idaapi, "action_desc_t")
+    register = getattr(ida_kernwin, "register_action", None) or getattr(idaapi, "register_action")
+
+    class _QueuePopupActionHandler(handler_base):
+        def __init__(self, action_kind):
+            handler_base.__init__(self)
+            self.action_kind = action_kind
+
+        def activate(self, ctx):
+            chooser = _ACTIVE_REVIEW_CHOOSER
+            return _run_queue_popup_action(self.action_kind, chooser, ctx)
+
+        def update(self, ctx):
+            return getattr(idaapi, "AST_ENABLE_ALWAYS", 1)
+
+    for action_id, label, kind in _QUEUE_ACTIONS:
+        try:
+            register(desc_ctor(action_id, label, _QueuePopupActionHandler(kind), "", label, -1))
+        except Exception:
+            # Already registered or unavailable in this IDA build.
+            pass
+    _QUEUE_ACTIONS_REGISTERED = True
+
+
+def _attach_queue_popup_actions(widget, popup_handle):
+    if not _IN_IDA or ida_kernwin is None:
+        return
+    _register_queue_popup_actions()
+    attach = getattr(ida_kernwin, "attach_action_to_popup", None) or getattr(idaapi, "attach_action_to_popup", None)
+    if not attach:
+        log.warn("Review Queue: attach_action_to_popup unavailable in this IDA build.")
+        return
+    for action_id, _label, _kind in _QUEUE_ACTIONS:
+        try:
+            attach(widget, popup_handle, action_id, None)
+        except TypeError:
+            try:
+                attach(widget, popup_handle, action_id, "")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # IDA chooser UI
 # ---------------------------------------------------------------------------
@@ -497,7 +737,7 @@ def show_review_queue_ui():
         def __init__(self, items):
             ida_kernwin.Choose.__init__(
                 self,
-                "reverse_partner — Review Queue (%d pending) | Enter: item | multi-select then close for Apply/Reject/Bulk" % len(items),
+                "reverse_partner — Review Queue (%d pending) | Enter: view item | Right-click: Apply/Reject selected | Ctrl+F: filter" % len(items),
                 [
                     ["EA",        8],
                     ["Old Name",  26],
@@ -511,6 +751,9 @@ def show_review_queue_ui():
             )
             self.items = items
             self.selected_indexes = []
+
+        def OnPopup(self, widget, popup_handle):
+            _attach_queue_popup_actions(widget, popup_handle)
 
         def OnSelectionChange(self, sel):
             try:
@@ -637,83 +880,13 @@ def show_review_queue_ui():
         log.warn("Review queue UI requires ida_kernwin.")
         return
 
+    global _ACTIVE_REVIEW_CHOOSER
     try:
         c = _Chooser(pending)
+        _ACTIVE_REVIEW_CHOOSER = c
         c.Show()
         selected_after_close = [pending[i] for i in getattr(c, "selected_indexes", [])
                                 if 0 <= i < len(pending)]
     except Exception as exc:
         log.err("Chooser error: %s" % exc)
         return
-
-    # Follow-up multi-select / bulk action after chooser closes.
-    from config import load_config
-    cfg = load_config()
-    selected_after_close = locals().get("selected_after_close", [])
-    action = idaapi.ask_str(
-        "",
-        0,
-        "Review Queue action\n\n"
-        "Selected rows: %d\n\n"
-        "a = Apply selected\n"
-        "r = Reject selected\n"
-        "b = Apply all high-confidence pending function renames\n"
-        "blank/cancel = do nothing\n\n"
-        "Double-click/Enter in the chooser still views/applies one item." % len(selected_after_close))
-    if action is None:
-        return
-    action = action.strip().lower()[:1]
-
-    if action == "a":
-        if not selected_after_close:
-            idaapi.info("No selected Review Queue rows to apply.")
-            return
-        plan = missing_dependency_plan(selected_after_close, load_review_queue())
-        missing_action = "selected_only"
-        if plan.get("parents_with_missing"):
-            ans = idaapi.ask_yn(idaapi.ASKBTN_CANCEL,
-                "%d selected parent suggestion(s) depend on pending child suggestions that are not selected.\n\n"
-                "YES = apply selected dependencies first too\n"
-                "NO = apply selected only\n"
-                "Cancel = do nothing" % plan.get("parents_with_missing", 0))
-            if ans == idaapi.ASKBTN_CANCEL:
-                return
-            missing_action = "include_dependencies" if ans == idaapi.ASKBTN_YES else "selected_only"
-        summary = apply_selected_queue_items(selected_after_close, missing_action=missing_action)
-        if summary.get("applied", 0):
-            idaapi.refresh_idaview_anyway()
-        idaapi.info("Applied selected queue items:\n- requested: %d\n- applied: %d\n- failed: %d\n- skipped/cancelled: %d" % (
-            summary.get("requested", 0), summary.get("applied", 0),
-            summary.get("failed", 0), summary.get("skipped", 0)))
-        return
-
-    if action == "r":
-        selected_pending = [i for i in selected_after_close if i.get("status") == "pending"]
-        if not selected_pending:
-            idaapi.info("No selected pending Review Queue rows to reject.")
-            return
-        ans = idaapi.ask_yn(idaapi.ASKBTN_NO,
-            "Reject %d selected suggestion(s)?" % len(selected_pending))
-        if ans != idaapi.ASKBTN_YES:
-            return
-        summary = reject_selected_queue_items(selected_pending)
-        idaapi.info("Rejected selected queue items:\n- requested: %d\n- rejected: %d" % (
-            summary.get("requested", 0), summary.get("rejected", 0)))
-        return
-
-    if action != "b":
-        return
-
-    threshold = cfg.get("auto_apply_confidence", 0.85)
-    bulk_items = high_confidence_pending_items(load_review_queue(), threshold)
-    ans = idaapi.ask_yn(idaapi.ASKBTN_NO,
-        "Apply %d pending function rename item(s) with confidence ≥ %.2f?" % (
-            len(bulk_items), threshold))
-    if ans != idaapi.ASKBTN_YES:
-        return
-    summary = apply_selected_queue_items(bulk_items, missing_action="include_dependencies")
-    if summary.get("applied", 0):
-        idaapi.refresh_idaview_anyway()
-    idaapi.info("Bulk high-confidence apply:\n- requested: %d\n- applied: %d\n- failed: %d\n- skipped/cancelled: %d" % (
-        summary.get("requested", 0), summary.get("applied", 0),
-        summary.get("failed", 0), summary.get("skipped", 0)))

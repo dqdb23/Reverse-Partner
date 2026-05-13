@@ -862,6 +862,77 @@ def test_queue_dependency_metadata_preserved_save_load():
         review_queue.save_review_queue = old_save
 
 
+def test_queue_get_selected_items_maps_visible_indexes():
+    from review_queue import get_selected_queue_items
+    class FakeChooser:
+        def __init__(self):
+            self.items = [
+                {"ea": "0x1", "status": "pending"},
+                {"ea": "0x2", "status": "applied"},
+                {"ea": "0x3", "status": "pending"},
+            ]
+            self.selected_indexes = [0, 1, 2, 99]
+    selected = get_selected_queue_items(FakeChooser())
+    check("queue_selected_index_map", [i["ea"] for i in selected], ["0x1", "0x3"])
+
+
+def test_queue_apply_selected_uses_only_selected_items():
+    import review_queue
+    a = {"kind": "function_rename", "ea": "0x1", "suggested_name": "a", "status": "pending"}
+    b = {"kind": "function_rename", "ea": "0x2", "suggested_name": "b", "status": "pending"}
+    calls = []
+    old_load, old_save = review_queue.load_review_queue, review_queue.save_review_queue
+    try:
+        review_queue.load_review_queue = lambda: [a, b]
+        review_queue.save_review_queue = lambda q: None
+        summary = review_queue.apply_selected_queue_items([a], [a, b], "selected_only",
+                                                          lambda item, dep_action=None: calls.append(item["ea"]) or True)
+        check("queue_apply_only_selected_calls", calls, ["0x1"])
+        check("queue_apply_only_selected_requested", summary["requested"], 1)
+    finally:
+        review_queue.load_review_queue = old_load
+        review_queue.save_review_queue = old_save
+
+
+def test_queue_apply_selected_ignores_applied_rejected():
+    import review_queue
+    pending = {"kind": "function_rename", "ea": "0x1", "suggested_name": "a", "status": "pending"}
+    applied = {"kind": "function_rename", "ea": "0x2", "suggested_name": "b", "status": "applied"}
+    rejected = {"kind": "function_rename", "ea": "0x3", "suggested_name": "c", "status": "rejected"}
+    calls = []
+    old_load, old_save = review_queue.load_review_queue, review_queue.save_review_queue
+    try:
+        review_queue.load_review_queue = lambda: [pending, applied, rejected]
+        review_queue.save_review_queue = lambda q: None
+        summary = review_queue.apply_selected_queue_items([pending, applied, rejected], [pending, applied, rejected],
+                                                          "selected_only",
+                                                          lambda item, dep_action=None: calls.append(item["ea"]) or True)
+        check("queue_apply_ignores_done_calls", calls, ["0x1"])
+        check("queue_apply_ignores_done_requested", summary["requested"], 1)
+    finally:
+        review_queue.load_review_queue = old_load
+        review_queue.save_review_queue = old_save
+
+
+def test_queue_status_update_preserves_dependency_metadata():
+    import review_queue
+    item = {"kind": "function_rename", "ea": "0x1", "suggested_name": "parent", "status": "pending",
+            "depends_on_pending_suggestions": [{"ea": "0x2", "suggested_name": "child"}],
+            "confidence_adjustment": {"original": 0.9, "final": 0.7}}
+    saved = []
+    old_load, old_save = review_queue.load_review_queue, review_queue.save_review_queue
+    try:
+        review_queue.load_review_queue = lambda: [dict(item)]
+        review_queue.save_review_queue = lambda q: saved.extend(q)
+        review_queue._update_queue_status(item, "applied")
+        check("queue_status_meta_status", saved[0]["status"], "applied")
+        check_true("queue_status_meta_deps", bool(saved[0].get("depends_on_pending_suggestions")))
+        check("queue_status_meta_conf", saved[0]["confidence_adjustment"]["final"], 0.7)
+    finally:
+        review_queue.load_review_queue = old_load
+        review_queue.save_review_queue = old_save
+
+
 # ---------------------------------------------------------------------------
 
 def run_all():
@@ -925,6 +996,10 @@ def run_all():
         test_queue_apply_selected_dependency_order_with_mock,
         test_queue_bulk_high_confidence_filters_threshold,
         test_queue_dependency_metadata_preserved_save_load,
+        test_queue_get_selected_items_maps_visible_indexes,
+        test_queue_apply_selected_uses_only_selected_items,
+        test_queue_apply_selected_ignores_applied_rejected,
+        test_queue_status_update_preserves_dependency_metadata,
     ]
 
     import io
