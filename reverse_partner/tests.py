@@ -742,6 +742,126 @@ def test_proposal_aware_no_review_pause_fewer_requests_than_strict_pause():
     check("proposal_full_estimate", proposal_est["estimated_requests"], 2)
 
 
+def test_config_missing_rename_order_default():
+    import config
+    migrated = config._migrate({})
+    check("config_missing_rename_order", migrated["rename_order"], "best_effort_bottom_up")
+
+
+def test_config_invalid_rename_order_fallback():
+    import config
+    migrated = config._migrate({"rename_order": "bad_mode"})
+    check("config_invalid_rename_order", migrated["rename_order"], "best_effort_bottom_up")
+
+
+def test_config_proposal_and_strict_preserved_save_load():
+    import os, tempfile, config
+    old_path = config._config_path
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        config._config_path = lambda: path
+        cfg = config.DEFAULT_CONFIG.copy()
+        cfg["rename_order"] = "proposal_aware_bottom_up"
+        config.save_config(cfg)
+        check("config_proposal_preserved", config.load_config()["rename_order"], "proposal_aware_bottom_up")
+        cfg["rename_order"] = "strict_bottom_up"
+        config.save_config(cfg)
+        check("config_strict_preserved", config.load_config()["rename_order"], "strict_bottom_up")
+    finally:
+        config._config_path = old_path
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def test_queue_selected_child_parent_sorted_child_first():
+    from review_queue import prepare_apply_selected_items
+    child = {"kind": "function_rename", "ea": "0x2", "suggested_name": "child", "status": "pending", "dependency_level": 0}
+    parent = {"kind": "function_rename", "ea": "0x1", "suggested_name": "parent", "status": "pending", "dependency_level": 1,
+              "depends_on_pending_suggestions": [{"ea": "0x2", "suggested_name": "child"}]}
+    items, plan = prepare_apply_selected_items([parent, child], [parent, child], "selected_only")
+    check("queue_apply_order_child_first", [i["ea"] for i in items], ["0x2", "0x1"])
+    check("queue_apply_no_missing", plan["parents_with_missing"], 0)
+
+
+def test_queue_reject_selected_only_pending():
+    from review_queue import reject_selected_in_queue
+    a = {"kind": "function_rename", "ea": "0x1", "suggested_name": "a", "status": "pending"}
+    b = {"kind": "function_rename", "ea": "0x2", "suggested_name": "b", "status": "pending"}
+    c = {"kind": "function_rename", "ea": "0x3", "suggested_name": "c", "status": "applied"}
+    updated, summary = reject_selected_in_queue([a, b, c], [a, c])
+    check("queue_reject_count", summary["rejected"], 1)
+    check("queue_reject_selected", updated[0]["status"], "rejected")
+    check("queue_reject_unselected_unchanged", updated[1]["status"], "pending")
+    check("queue_reject_applied_unchanged", updated[2]["status"], "applied")
+
+
+def test_queue_missing_dependency_plan_and_selected_child_no_warn():
+    from review_queue import missing_dependency_plan
+    child = {"kind": "function_rename", "ea": "0x2", "suggested_name": "child", "status": "pending"}
+    parent = {"kind": "function_rename", "ea": "0x1", "suggested_name": "parent", "status": "pending",
+              "depends_on_pending_suggestions": [{"ea": "0x2", "suggested_name": "child"}]}
+    missing = missing_dependency_plan([parent], [parent, child])
+    check("queue_missing_parent_count", missing["parents_with_missing"], 1)
+    check("queue_missing_dep", missing["missing_dependencies"][0]["ea"], "0x2")
+    none = missing_dependency_plan([parent, child], [parent, child])
+    check("queue_selected_child_no_missing", none["parents_with_missing"], 0)
+
+
+def test_queue_apply_selected_dependency_order_with_mock():
+    import review_queue
+    child = {"kind": "function_rename", "ea": "0x2", "suggested_name": "child", "status": "pending", "dependency_level": 0}
+    parent = {"kind": "function_rename", "ea": "0x1", "suggested_name": "parent", "status": "pending", "dependency_level": 1,
+              "depends_on_pending_suggestions": [{"ea": "0x2", "suggested_name": "child"}]}
+    calls = []
+    old_load, old_save = review_queue.load_review_queue, review_queue.save_review_queue
+    try:
+        review_queue.load_review_queue = lambda: [parent, child]
+        review_queue.save_review_queue = lambda q: None
+        def fake_apply(item, dep_action=None):
+            calls.append(item["ea"])
+            return True
+        summary = review_queue.apply_selected_queue_items([parent, child], [parent, child], "selected_only", fake_apply)
+        check("queue_apply_mock_order", calls, ["0x2", "0x1"])
+        check("queue_apply_mock_applied", summary["applied"], 2)
+    finally:
+        review_queue.load_review_queue = old_load
+        review_queue.save_review_queue = old_save
+
+
+def test_queue_bulk_high_confidence_filters_threshold():
+    from review_queue import high_confidence_pending_items
+    hi = {"kind": "function_rename", "ea": "0x1", "suggested_name": "hi", "confidence": 0.9, "status": "pending"}
+    low = {"kind": "function_rename", "ea": "0x2", "suggested_name": "low", "confidence": 0.5, "status": "pending"}
+    var = {"kind": "variable_rename", "ea": "0x3", "new_var": "v", "confidence": 0.99, "status": "pending"}
+    applied = {"kind": "function_rename", "ea": "0x4", "suggested_name": "done", "confidence": 0.99, "status": "applied"}
+    items = high_confidence_pending_items([low, hi, var, applied], 0.85)
+    check("queue_bulk_high_only", [i["suggested_name"] for i in items], ["hi"])
+
+
+def test_queue_dependency_metadata_preserved_save_load():
+    import review_queue
+    old_load, old_save = review_queue.load_review_queue, review_queue.save_review_queue
+    stored = []
+    try:
+        review_queue.load_review_queue = lambda: []
+        review_queue.save_review_queue = lambda q: stored.extend(q)
+        review_queue.add_to_review_queue(0x1, "sub_1", {
+            "name": "parent", "confidence": 0.7,
+            "depends_on_pending_suggestions": [{"ea": "0x2", "suggested_name": "child"}],
+            "confidence_adjustment": {"original": 0.9, "final": 0.7},
+            "dependency_level": 1,
+            "child_support_confidence": 0.25,
+        }, "model", "provider")
+        check_true("queue_dep_meta_saved", bool(stored[0].get("depends_on_pending_suggestions")))
+        check("queue_dep_level_saved", stored[0].get("dependency_level"), 1)
+    finally:
+        review_queue.load_review_queue = old_load
+        review_queue.save_review_queue = old_save
+
+
 # ---------------------------------------------------------------------------
 
 def run_all():
@@ -796,6 +916,15 @@ def run_all():
         test_reduce_scope_respects_max_functions_per_run,
         test_retry_only_missing_functions,
         test_proposal_aware_no_review_pause_fewer_requests_than_strict_pause,
+        test_config_missing_rename_order_default,
+        test_config_invalid_rename_order_fallback,
+        test_config_proposal_and_strict_preserved_save_load,
+        test_queue_selected_child_parent_sorted_child_first,
+        test_queue_reject_selected_only_pending,
+        test_queue_missing_dependency_plan_and_selected_child_no_warn,
+        test_queue_apply_selected_dependency_order_with_mock,
+        test_queue_bulk_high_confidence_filters_threshold,
+        test_queue_dependency_metadata_preserved_save_load,
     ]
 
     import io

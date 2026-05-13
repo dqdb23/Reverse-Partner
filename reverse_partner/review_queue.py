@@ -238,7 +238,7 @@ def _find_pending_dependency_items(parent_item: dict) -> list:
     return sort_review_queue_dependencies(matches)
 
 
-def apply_queue_item(item: dict) -> bool:
+def apply_queue_item(item: dict, dependency_action: str = None) -> bool:
     """
     Apply one review queue item (rename + comment).
     Returns True on success.
@@ -281,7 +281,7 @@ def apply_queue_item(item: dict) -> bool:
                 return True
             return False
 
-        dep_action = choose_dependency_apply_action(item)
+        dep_action = dependency_action or choose_dependency_apply_action(item)
         if dep_action == "cancel":
             log.warn("Apply cancelled: parent suggestion depends on pending child suggestions.")
             return False
@@ -333,7 +333,8 @@ def _same_queue_item(left: dict, right: dict) -> bool:
     if left.get("ea") != right.get("ea"):
         return False
     if kind == "variable_rename":
-        return left.get("old_var") == right.get("old_var")
+        return (left.get("old_var") == right.get("old_var")
+                and left.get("new_var") == right.get("new_var"))
     if kind == "prototype_change":
         return left.get("new_prototype") == right.get("new_prototype")
     return left.get("suggested_name") == right.get("suggested_name")
@@ -346,6 +347,129 @@ def _update_queue_status(item: dict, new_status: str):
         if q.get("status") == "pending" and _same_queue_item(q, item):
             q["status"] = new_status
     save_review_queue(queue)
+
+
+def _item_key(item: dict) -> tuple:
+    kind = item.get("kind", "function_rename")
+    if kind == "variable_rename":
+        return (kind, item.get("ea"), item.get("old_var"), item.get("new_var"))
+    if kind == "prototype_change":
+        return (kind, item.get("ea"), item.get("new_prototype"))
+    return (kind, item.get("ea"), item.get("suggested_name"))
+
+
+def reject_selected_in_queue(queue: list, selected: list) -> tuple:
+    """Pure helper: reject selected pending items only. Returns (queue, summary)."""
+    selected_keys = set(_item_key(i) for i in (selected or []) if i.get("status") == "pending")
+    rejected = 0
+    out = []
+    for item in queue or []:
+        new_item = dict(item)
+        if new_item.get("status") == "pending" and _item_key(new_item) in selected_keys:
+            new_item["status"] = "rejected"
+            rejected += 1
+        out.append(new_item)
+    return out, {"requested": len(selected_keys), "rejected": rejected}
+
+
+def _dependency_key(dep: dict) -> tuple:
+    return ("function_rename", str(dep.get("ea", "")).lower(), dep.get("suggested_name", ""))
+
+
+def missing_dependency_plan(selected: list, queue: list) -> dict:
+    selected_keys = set(_item_key(i) for i in selected or [])
+    pending_by_dep = {}
+    for item in queue or []:
+        if item.get("status") != "pending" or item.get("kind", "function_rename") != "function_rename":
+            continue
+        pending_by_dep[("function_rename", str(item.get("ea", "")).lower(), item.get("suggested_name", ""))] = item
+    missing = []
+    parents = 0
+    for item in selected or []:
+        if item.get("kind", "function_rename") != "function_rename":
+            continue
+        deps = item.get("depends_on_pending_suggestions") or []
+        item_missing = []
+        for dep in deps:
+            if not isinstance(dep, dict):
+                continue
+            key = _dependency_key(dep)
+            dep_item = pending_by_dep.get(key)
+            if dep_item and _item_key(dep_item) not in selected_keys:
+                item_missing.append(dep_item)
+        if item_missing:
+            parents += 1
+            missing.extend(item_missing)
+    unique = []
+    seen = set()
+    for item in missing:
+        key = _item_key(item)
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return {"parents_with_missing": parents, "missing_dependencies": sort_review_queue_dependencies(unique)}
+
+
+def prepare_apply_selected_items(selected: list, queue: list, missing_action: str = "cancel") -> tuple:
+    """
+    Return dependency-sorted apply list and a plan.
+    missing_action: include_dependencies | selected_only | cancel
+    """
+    selected_pending = [i for i in (selected or []) if i.get("status") == "pending"]
+    plan = missing_dependency_plan(selected_pending, queue or [])
+    if plan["parents_with_missing"] and missing_action == "cancel":
+        return [], {"cancelled": True, "requested": len(selected_pending), **plan}
+    apply_items = list(selected_pending)
+    if plan["parents_with_missing"] and missing_action == "include_dependencies":
+        existing = set(_item_key(i) for i in apply_items)
+        for dep in plan["missing_dependencies"]:
+            if _item_key(dep) not in existing:
+                apply_items.append(dep)
+                existing.add(_item_key(dep))
+    return sort_review_queue_dependencies(apply_items), {"cancelled": False, "requested": len(selected_pending), **plan}
+
+
+def apply_selected_queue_items(selected: list, queue: list = None, missing_action: str = "cancel", apply_func=None) -> dict:
+    if not require_static_mode("Apply Selected Queue Items"):
+        return {"requested": len(selected or []), "applied": 0, "failed": 0, "skipped": len(selected or [])}
+    queue = load_review_queue() if queue is None else queue
+    apply_items, plan = prepare_apply_selected_items(selected, queue, missing_action)
+    if plan.get("cancelled"):
+        return {"requested": plan.get("requested", 0), "applied": 0, "failed": 0, "skipped": plan.get("requested", 0), "cancelled": True}
+    apply_func = apply_func or apply_queue_item
+    requested = len(apply_items)
+    applied = failed = skipped = 0
+    for item in apply_items:
+        if item.get("status") != "pending":
+            skipped += 1
+            continue
+        if apply_func(item, "apply_only"):
+            _update_queue_status(item, "applied")
+            applied += 1
+        else:
+            failed += 1
+    summary = {"requested": requested, "applied": applied, "failed": failed, "skipped": skipped}
+    log.info("Applied selected queue items: requested=%d applied=%d failed=%d skipped/cancelled=%d" % (
+        requested, applied, failed, skipped))
+    return summary
+
+
+def reject_selected_queue_items(selected: list, queue: list = None) -> dict:
+    queue = load_review_queue() if queue is None else queue
+    updated, summary = reject_selected_in_queue(queue, selected)
+    save_review_queue(updated)
+    log.info("Rejected selected queue items: requested=%d rejected=%d" % (
+        summary["requested"], summary["rejected"]))
+    return summary
+
+
+def high_confidence_pending_items(queue: list, threshold: float) -> list:
+    return sort_review_queue_dependencies([
+        q for q in (queue or [])
+        if q.get("status") == "pending"
+        and q.get("kind", "function_rename") == "function_rename"
+        and float(q.get("confidence", 0.0) or 0.0) >= threshold
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +497,7 @@ def show_review_queue_ui():
         def __init__(self, items):
             ida_kernwin.Choose.__init__(
                 self,
-                "reverse_partner — Review Queue (%d pending)" % len(items),
+                "reverse_partner — Review Queue (%d pending) | Enter: item | multi-select then close for Apply/Reject/Bulk" % len(items),
                 [
                     ["EA",        8],
                     ["Old Name",  26],
@@ -386,6 +510,14 @@ def show_review_queue_ui():
                 flags=ida_kernwin.Choose.CH_MULTI,
             )
             self.items = items
+            self.selected_indexes = []
+
+        def OnSelectionChange(self, sel):
+            try:
+                self.selected_indexes = [int(x) for x in (sel or [])]
+            except Exception:
+                self.selected_indexes = []
+            return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
         def OnGetSize(self):
             return len(self.items)
@@ -508,32 +640,80 @@ def show_review_queue_ui():
     try:
         c = _Chooser(pending)
         c.Show()
+        selected_after_close = [pending[i] for i in getattr(c, "selected_indexes", [])
+                                if 0 <= i < len(pending)]
     except Exception as exc:
         log.err("Chooser error: %s" % exc)
         return
 
-    # Bulk apply offer after chooser closes
+    # Follow-up multi-select / bulk action after chooser closes.
     from config import load_config
-    cfg   = load_config()
-    ans   = idaapi.ask_yn(idaapi.ASKBTN_NO,
-        "Bulk-apply ALL pending items with confidence ≥ %.2f?" %
-        cfg.get("auto_apply_confidence", 0.85))
+    cfg = load_config()
+    selected_after_close = locals().get("selected_after_close", [])
+    action = idaapi.ask_str(
+        "",
+        0,
+        "Review Queue action\n\n"
+        "Selected rows: %d\n\n"
+        "a = Apply selected\n"
+        "r = Reject selected\n"
+        "b = Apply all high-confidence pending function renames\n"
+        "blank/cancel = do nothing\n\n"
+        "Double-click/Enter in the chooser still views/applies one item." % len(selected_after_close))
+    if action is None:
+        return
+    action = action.strip().lower()[:1]
+
+    if action == "a":
+        if not selected_after_close:
+            idaapi.info("No selected Review Queue rows to apply.")
+            return
+        plan = missing_dependency_plan(selected_after_close, load_review_queue())
+        missing_action = "selected_only"
+        if plan.get("parents_with_missing"):
+            ans = idaapi.ask_yn(idaapi.ASKBTN_CANCEL,
+                "%d selected parent suggestion(s) depend on pending child suggestions that are not selected.\n\n"
+                "YES = apply selected dependencies first too\n"
+                "NO = apply selected only\n"
+                "Cancel = do nothing" % plan.get("parents_with_missing", 0))
+            if ans == idaapi.ASKBTN_CANCEL:
+                return
+            missing_action = "include_dependencies" if ans == idaapi.ASKBTN_YES else "selected_only"
+        summary = apply_selected_queue_items(selected_after_close, missing_action=missing_action)
+        if summary.get("applied", 0):
+            idaapi.refresh_idaview_anyway()
+        idaapi.info("Applied selected queue items:\n- requested: %d\n- applied: %d\n- failed: %d\n- skipped/cancelled: %d" % (
+            summary.get("requested", 0), summary.get("applied", 0),
+            summary.get("failed", 0), summary.get("skipped", 0)))
+        return
+
+    if action == "r":
+        selected_pending = [i for i in selected_after_close if i.get("status") == "pending"]
+        if not selected_pending:
+            idaapi.info("No selected pending Review Queue rows to reject.")
+            return
+        ans = idaapi.ask_yn(idaapi.ASKBTN_NO,
+            "Reject %d selected suggestion(s)?" % len(selected_pending))
+        if ans != idaapi.ASKBTN_YES:
+            return
+        summary = reject_selected_queue_items(selected_pending)
+        idaapi.info("Rejected selected queue items:\n- requested: %d\n- rejected: %d" % (
+            summary.get("requested", 0), summary.get("rejected", 0)))
+        return
+
+    if action != "b":
+        return
+
+    threshold = cfg.get("auto_apply_confidence", 0.85)
+    bulk_items = high_confidence_pending_items(load_review_queue(), threshold)
+    ans = idaapi.ask_yn(idaapi.ASKBTN_NO,
+        "Apply %d pending function rename item(s) with confidence ≥ %.2f?" % (
+            len(bulk_items), threshold))
     if ans != idaapi.ASKBTN_YES:
         return
-    if not require_static_mode("Bulk Apply Queue"):
-        return
-
-    fresh     = [q for q in load_review_queue() if q.get("status") == "pending"]
-    threshold = cfg.get("auto_apply_confidence", 0.85)
-    n_applied = 0
-    for it in fresh:
-        if it.get("kind", "function_rename") != "function_rename":
-            continue
-        if it.get("confidence", 0.0) >= threshold:
-            if apply_queue_item(it):
-                it["status"] = "applied"
-                _update_queue_status(it, "applied")
-                n_applied += 1
-
-    idaapi.refresh_idaview_anyway()
-    idaapi.info("Bulk applied %d suggestion(s) from the review queue." % n_applied)
+    summary = apply_selected_queue_items(bulk_items, missing_action="include_dependencies")
+    if summary.get("applied", 0):
+        idaapi.refresh_idaview_anyway()
+    idaapi.info("Bulk high-confidence apply:\n- requested: %d\n- applied: %d\n- failed: %d\n- skipped/cancelled: %d" % (
+        summary.get("requested", 0), summary.get("applied", 0),
+        summary.get("failed", 0), summary.get("skipped", 0)))

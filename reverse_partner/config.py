@@ -140,7 +140,26 @@ DEFAULT_MODEL_MAP: dict = {
 
 VALID_PROVIDERS   = ("gemini", "groq", "openai", "openai_compatible", "ollama", "lmstudio")
 VALID_NAMING_MODES = ("conservative", "malware", "blog")
+VALID_RENAME_ORDERS = ("best_effort_bottom_up", "strict_bottom_up", "proposal_aware_bottom_up")
+VALID_REQUEST_BUDGET_MODES = ("fast_low_requests", "free_key_balanced", "quality_strict")
 
+
+
+def normalize_rename_order(value: str) -> str:
+    value = str(value or "best_effort_bottom_up").strip().lower()
+    if value in VALID_RENAME_ORDERS:
+        return value
+    try:
+        from logger import log
+        log.warn("Invalid rename_order '%s'; using best_effort_bottom_up." % value)
+    except Exception:
+        pass
+    return "best_effort_bottom_up"
+
+
+def normalize_request_budget_mode(value: str) -> str:
+    value = str(value or "free_key_balanced").strip().lower()
+    return value if value in VALID_REQUEST_BUDGET_MODES else "free_key_balanced"
 
 def _config_path() -> str:
     if _IN_IDA:
@@ -159,6 +178,8 @@ def _migrate(data: dict) -> dict:
     for k, v in DEFAULT_CONFIG.items():
         if k not in data:
             data[k] = v
+    data["rename_order"] = normalize_rename_order(data.get("rename_order"))
+    data["request_budget_mode"] = normalize_request_budget_mode(data.get("request_budget_mode"))
     return data
 
 
@@ -176,6 +197,8 @@ def load_config() -> dict:
 def save_config(cfg: dict):
     try:
         cfg.pop("api_key", None)  # never save legacy field
+        cfg["rename_order"] = normalize_rename_order(cfg.get("rename_order"))
+        cfg["request_budget_mode"] = normalize_request_budget_mode(cfg.get("request_budget_mode"))
         with open(_config_path(), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
     except Exception as exc:
