@@ -885,6 +885,8 @@ def show_review_queue_ui():
         c = _Chooser(pending)
         _ACTIVE_REVIEW_CHOOSER = c
         c.Show()
+        selected_after_close = [pending[i] for i in getattr(c, "selected_indexes", [])
+                                if 0 <= i < len(pending)]
     except Exception as exc:
         log.err("Chooser error: %s" % exc)
         return
